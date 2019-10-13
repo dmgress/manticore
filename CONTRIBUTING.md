@@ -25,11 +25,15 @@ response if you ask in our [chat room](https://empireslacking.herokuapp.com/)
 ## Code
 
 Manticore uses the pull request contribution model. Please make an account on
-github, fork this repo, and submit code contributions via pull request. For
+Github, fork this repo, and submit code contributions via pull request. For
 more documentation, look [here](https://guides.github.com/activities/forking/).
 
 Some pull request guidelines:
 
+- We use the [`black`](https://black.readthedocs.io/en/stable/index.html) auto-formatter
+  to enforce style conventions in Manticore. To ensure your code is properly 
+  formatted, run `black .` in the manticore directory before
+  committing.
 - Minimize irrelevant changes (formatting, whitespace, etc) to code that would
   otherwise not be touched by this patch. Save formatting or style corrections
   for a separate pull request that does not make any semantic changes.

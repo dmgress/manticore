@@ -1,58 +1,66 @@
 import os
 import sys
 import glob
-import signal
-import cPickle
 import logging
 import tempfile
-try:
-    import cStringIO as StringIO
-except ImportError:
-    import StringIO
+import io
+
 
 from contextlib import contextmanager
-from multiprocessing.managers import SyncManager
 
-from .smtlib import solver
-from .smtlib.solver import SolverException
-from .state import State
+try:
+    from contextlib import nullcontext
+except ImportError:
+
+    class nullcontext:
+        def __init__(self, enter_result=None):
+            self.enter_result = enter_result
+
+        def __enter__(self):
+            return self.enter_result
+
+        def __exit__(self, *excinfo):
+            pass
+
+
+import time
+import os
+import errno
+import threading
+from ..utils import config
+from ..utils.helpers import PickleSerializer
+from .smtlib.solver import Z3Solver
+from .state import StateBase
 
 logger = logging.getLogger(__name__)
 
-manager = SyncManager()
-manager.start(lambda: signal.signal(signal.SIGINT, signal.SIG_IGN))
+consts = config.get_group("workspace")
+consts.add(
+    "prefix", default="mcore_", description="The prefix to use for output and workspace directories"
+)
+consts.add("dir", default=".", description="Location of where to create workspace directories")
 
 
-class StateSerializer(object):
-    """
-    StateSerializer can serialize and deserialize :class:`~manticore.core.state.State` objects from and to
-    stream-like objects.
-    """
-    def __init__(self):
-        pass
+class Testcase:
+    def __init__(self, workspace, prefix):
+        self._num = workspace._increment_id()
+        self._prefix = prefix
+        self._ws = workspace
 
-    def serialize(self, state, f):
-        raise NotImplementedError
+    @property
+    def prefix(self):
+        return self._prefix
 
-    def deserialize(self, f):
-        raise NotImplementedError
+    @property
+    def num(self):
+        return self._num
 
-
-class PickleSerializer(StateSerializer):
-    def serialize(self, state, f):
-        try:
-            f.write(cPickle.dumps(state, 2))
-        except RuntimeError:
-            # recursion exceeded. try a slower, iterative solution
-            from ..utils import iterpickle
-            logger.debug("Using iterpickle to dump state")
-            f.write(iterpickle.dumps(state, 2))
-
-    def deserialize(self, f):
-        return cPickle.load(f)
+    def open_stream(self, suffix="", binary=False):
+        stream_name = f"{self._prefix}_{self._num:08x}.{suffix}"
+        return self._ws.save_stream(stream_name, binary=binary)
 
 
-class Store(object):
+class Store:
     """
     A `Store` can save arbitrary keys/values (including states) and file streams.
     Used for generating output, state saving and state loading.
@@ -77,22 +85,26 @@ class Store(object):
         :param str desc: Store descriptor
         :return: Store instance
         """
-        type_, uri = ('fs', None) if desc is None else desc.split(':', 1)
+        type_, uri = ("fs", None) if desc is None else desc.split(":", 1)
         for subclass in cls.__subclasses__():
             if subclass.store_type == type_:
                 return subclass(uri)
-        raise NotImplementedError("Storage type '{0}' not supported.".format(type_))
+        raise NotImplementedError(f"Storage type '{type_}' not supported.")
 
-    def __init__(self, uri, state_serialization_method='pickle'):
-        assert self.__class__ != Store, "The Store class can not be instantiated (create a subclass)"
+    def __init__(self, uri, state_serialization_method="pickle"):
+        assert (
+            self.__class__ != Store
+        ), "The Store class can not be instantiated (create a subclass)"
 
         self.uri = uri
         self._sub = []
 
-        if state_serialization_method == 'pickle':
+        if state_serialization_method == "pickle":
             self._serializer = PickleSerializer()
         else:
-            raise NotImplementedError("Pickling method '{}' not supported.".format(state_serialization_method))
+            raise NotImplementedError(
+                f"Pickling method '{state_serialization_method}' not supported."
+            )
 
     # save_value/load_value and save_stream/load_stream are implemented in terms of each other. A backing store
     # can choose the pair it's best optimized for.
@@ -107,18 +119,18 @@ class Store(object):
         with self.save_stream(key) as s:
             s.write(value)
 
-    def load_value(self, key):
+    def load_value(self, key, binary=False):
         """
         Load an arbitrary value identified by `key`.
 
         :param str key: The key that identifies the value
         :return: The loaded value
         """
-        with self.load_stream(key) as s:
+        with self.load_stream(key, binary=binary) as s:
             return s.read()
 
     @contextmanager
-    def save_stream(self, key, *rest, **kwargs):
+    def save_stream(self, key, binary=False):
         """
         Return a managed file-like object into which the calling code can write
         arbitrary data.
@@ -126,12 +138,12 @@ class Store(object):
         :param key:
         :return: A managed stream-like object
         """
-        s = StringIO.StringIO()
+        s = io.BytesIO() if binary else io.StringIO()
         yield s
         self.save_value(key, s.getvalue())
 
     @contextmanager
-    def load_stream(self, key):
+    def load_stream(self, key, binary=False):
         """
         Return a managed file-like object from which the calling code can read
         previously-serialized data.
@@ -139,18 +151,18 @@ class Store(object):
         :param key:
         :return: A managed stream-like object
         """
-        value = self.load_value(key)
-        yield StringIO.StringIO(value)
+        value = self.load_value(key, binary=binary)
+        yield io.BytesIO(value) if binary else io.StringIO(value)
 
     def save_state(self, state, key):
         """
         Save a state to storage.
 
-        :param manticore.core.State state:
+        :param manticore.core.StateBase state:
         :param str key:
         :return:
         """
-        with self.save_stream(key) as f:
+        with self.save_stream(key, binary=True) as f:
             self._serializer.serialize(state, f)
 
     def load_state(self, key, delete=True):
@@ -158,12 +170,14 @@ class Store(object):
         Load a state from storage.
 
         :param key: key that identifies state
-        :rtype: manticore.core.State
+        :rtype: manticore.core.StateBase
         """
-        with self.load_stream(key) as f:
+
+        with self.load_stream(key, binary=True) as f:
             state = self._serializer.deserialize(f)
             if delete:
                 self.rm(key)
+
             return state
 
     def rm(self, key):
@@ -182,47 +196,91 @@ class Store(object):
         """
         raise NotImplementedError
 
+    def lock(self):
+        raise NotImplementedError
+
 
 class FilesystemStore(Store):
     """
     A directory-backed Manticore workspace
     """
-    store_type = 'fs'
+
+    store_type = "fs"
 
     def __init__(self, uri=None):
         """
         :param uri: The path to on-disk workspace, or None.
         """
+        self._tlock = threading.Lock()
         if not uri:
-            uri = os.path.abspath(tempfile.mkdtemp(prefix="mcore_", dir='./'))
+            uri = os.path.abspath(tempfile.mkdtemp(prefix=consts.prefix, dir=consts.dir))
 
         if os.path.exists(uri):
-            assert os.path.isdir(uri), 'Store must be a directory'
+            assert os.path.isdir(uri), "Store must be a directory"
         else:
             os.mkdir(uri)
 
-        super(FilesystemStore, self).__init__(uri)
+        super().__init__(uri)
 
     @contextmanager
-    def save_stream(self, key, binary=False):
+    def lock(self):
+        lockfile = os.path.join(self.uri, ".lock")
+        with self._tlock:
+            while True:
+                try:
+                    fd = os.open(lockfile, os.O_CREAT | os.O_EXCL | os.O_RDWR)
+                except OSError as e:
+                    if e.errno != errno.EEXIST:
+                        raise
+                    time.sleep(0.05)
+                else:
+                    yield
+                    os.close(fd)
+                    os.unlink(lockfile)
+                    break
+
+    @contextmanager
+    def stream(self, key, mode="r", lock=False):
+        """
+        Yield a file object representing `key`
+
+        :param str key: The file to save to
+        :param mode: mode is an optional string that specifies the mode in which the file is opened
+        :param lock: exclusive access if True
+        :return:
+        """
+        if lock:
+            with self.lock():
+                with self.stream(key, mode, lock=False) as f:
+                    yield f
+        else:
+            with open(os.path.join(self.uri, key), mode) as f:
+                yield f
+
+    @contextmanager
+    def save_stream(self, key, binary=False, lock=False):
         """
         Yield a file object representing `key`
 
         :param str key: The file to save to
         :param bool binary: Whether we should treat it as binary
+        :param lock: exclusive access if True
         :return:
         """
-        mode = 'wb' if binary else 'w'
-        with open(os.path.join(self.uri, key), mode) as f:
+        mode = "wb" if binary else "w"
+        with self.stream(key, mode, lock) as f:
             yield f
 
     @contextmanager
-    def load_stream(self, key):
+    def load_stream(self, key, binary=False, lock=False):
         """
-        :param key:
+        :param str key: name of stream to load
+        :param bool binary: Whether we should treat it as binary
+        :param lock: exclusive access if True
         :return:
         """
-        with open(os.path.join(self.uri, key), 'r') as f:
+        mode = "rb" if binary else "r"
+        with self.stream(key, mode, lock) as f:
             yield f
 
     def rm(self, key):
@@ -232,7 +290,8 @@ class FilesystemStore(Store):
         :param str key: The file to delete
         """
         path = os.path.join(self.uri, key)
-        os.remove(path)
+        if os.path.exists(path):
+            os.remove(path)
 
     def ls(self, glob_str):
         """
@@ -242,29 +301,31 @@ class FilesystemStore(Store):
         :return: list of matched keys
         """
         path = os.path.join(self.uri, glob_str)
-        return map(lambda s: os.path.split(s)[1], glob.glob(path))
+        return [os.path.split(s)[1] for s in glob.glob(path)]
 
 
 class MemoryStore(Store):
     """
     An in-memory (dict) Manticore workspace.
 
-    NOTE: This is mostly used for experimentation and testing funcionality.
+    NOTE: This is mostly used for experimentation and testing functionality.
     Can not be used with multiple workers!
     """
-    store_type = 'mem'
 
-    #TODO(yan): Once we get a global config store, check it to make sure
+    store_type = "mem"
+
+    # TODO(yan): Once we get a global config store, check it to make sure
     # we're executing in a single-worker or test environment.
 
     def __init__(self, uri=None):
+        self._lock = threading.RLock()
         self._data = {}
-        super(MemoryStore, self).__init__(None)
+        super().__init__(None)
 
     def save_value(self, key, value):
         self._data[key] = value
 
-    def load_value(self, key):
+    def load_value(self, key, binary=False):
         return self._data.get(key)
 
     def rm(self, key):
@@ -273,11 +334,29 @@ class MemoryStore(Store):
     def ls(self, glob_str):
         return list(self._data)
 
+    @contextmanager
+    def lock(self):
+        with self._lock:
+            yield
+
+    @contextmanager
+    def stream(self, key, mode="r", lock=False):
+        if lock:
+            raise Exception("mem: does not support concurrency")
+        if "b" in mode:
+            s = io.BytesIO(self._data.get(key, b""))
+        else:
+            s = io.StringIO(self._data.get(key, ""))
+        yield s
+        self._data[key] = s.getvalue()
+
+
 class RedisStore(Store):
     """
     A redis-backed Manticore workspace
     """
-    store_type = 'redis'
+
+    store_type = "redis"
 
     def __init__(self, uri=None):
         """
@@ -287,10 +366,15 @@ class RedisStore(Store):
         # Local import to avoid an explicit dependency
         import redis
 
-        hostname, port = uri.split(':')
+        hostname, port = uri.split(":")
         self._client = redis.StrictRedis(host=hostname, port=int(port), db=0)
 
-        super(RedisStore, self).__init__(uri)
+        super().__init__(uri)
+
+    @contextmanager
+    def lock(self):
+        with self._client.lock(".lock"):
+            yield
 
     def save_value(self, key, value):
         """
@@ -318,59 +402,55 @@ class RedisStore(Store):
         return self._client.keys(glob_str)
 
 
-# This is copied from Executor to not create a dependency on the naming of the lock field
-def sync(f):
-    """ Synchronization decorator. """
-    def new_function(self, *args, **kw):
-        self._lock.acquire()
-        try:
-            return f(self, *args, **kw)
-        finally:
-            self._lock.release()
-    return new_function
-
-
-class Workspace(object):
+class Workspace:
     """
     A workspace maintains a list of states to run and assigns them IDs.
     """
 
-    def __init__(self, lock, store_or_desc=None):
+    def __init__(self, store_or_desc=None):
         if isinstance(store_or_desc, Store):
             self._store = store_or_desc
         else:
             self._store = Store.fromdescriptor(store_or_desc)
         self._serializer = PickleSerializer()
-        self._last_id = manager.Value('i', 0)
-        self._lock = lock
-        self._prefix = 'state_'
-        self._suffix = '.pkl'
+        self._prefix = "state_"
+        self._suffix = ".pkl"
+
+    @property
+    def uri(self):
+        return self._store.uri
 
     def try_loading_workspace(self):
-        state_names = self._store.ls('{}*'.format(self._prefix))
+        state_names = self._store.ls(f"{self._prefix}*")
 
         def get_state_id(name):
-            return int(name[len(self._prefix):-len(self._suffix)], 16)
+            return int(name[len(self._prefix) : -len(self._suffix)], 16)
 
-        state_ids = map(get_state_id, state_names)
+        state_ids = list(map(get_state_id, state_names))
 
         if not state_ids:
             return []
 
-        self._last_id.value = max(state_ids) + 1
-
         return state_ids
 
-    @sync
     def _get_id(self):
         """
         Get a unique state id.
 
         :rtype: int
         """
-        id_ = self._last_id.value
-        self._last_id.value += 1
-        return id_
+        with self._store.lock():
+            try:
+                with self._store.load_stream(".state_id") as f:
+                    last_id = int(f.read())
+            except Exception as e:
+                last_id = 0
+            else:
+                last_id += 1
+            with self._store.save_stream(".state_id") as f:
+                f.write(f"{last_id}")
+                f.flush()
+        return last_id
 
     def load_state(self, state_id, delete=True):
         """
@@ -380,20 +460,25 @@ class Workspace(object):
         :return: The deserialized state
         :rtype: State
         """
-        return self._store.load_state('{}{:08x}{}'.format(self._prefix, state_id, self._suffix), delete=delete)
+        return self._store.load_state(f"{self._prefix}{state_id:08x}{self._suffix}", delete=delete)
 
-    def save_state(self, state):
+    def save_state(self, state, state_id=None):
         """
         Save a state to storage, return identifier.
 
         :param state: The state to save
+        :param int state_id: If not None force the state id potentially overwriting old states
         :return: New state id
         :rtype: int
         """
-        assert isinstance(state, State)
-        id_ = self._get_id()
-        self._store.save_state(state, '{}{:08x}{}'.format(self._prefix, id_, self._suffix))
-        return id_
+        assert isinstance(state, StateBase)
+        if state_id is None:
+            state_id = self._get_id()
+        else:
+            self.rm_state(state_id)
+
+        self._store.save_state(state, f"{self._prefix}{state_id:08x}{self._suffix}")
+        return state_id
 
     def rm_state(self, state_id):
         """
@@ -401,10 +486,10 @@ class Workspace(object):
 
         :param state_id: The state reference of what to load
         """
-        return self._store.rm('{}{:08x}{}'.format(self._prefix, state_id, self._suffix))
+        return self._store.rm(f"{self._prefix}{state_id:08x}{self._suffix}")
 
 
-class ManticoreOutput(object):
+class ManticoreOutput:
     """
     Functionality related to producing output. Responsible for generating state summaries,
     coverage information, etc.
@@ -412,34 +497,18 @@ class ManticoreOutput(object):
     Invoked only from :class:`manticore.Manticore` from a single parent process, so
     locking is not required.
     """
+
     def __init__(self, desc=None):
         """
         Create an object capable of producing Manticore output.
 
         :param desc: A descriptor ('type:uri') of where to write output.
         """
-        self._named_key_prefix = 'test'
+        self._named_key_prefix = "test"
         self._descriptor = desc
         self._store = Store.fromdescriptor(desc)
-        self._last_id = 0
-        self._id_gen = manager.Value('i', self._last_id)
-        self._lock = manager.Condition(manager.RLock())
 
-    def testcase(self, prefix='test'):
-        class Testcase(object):
-            def __init__(self, workspace, prefix):
-                self._num = workspace._increment_id()
-                self._prefix = prefix
-                self._ws = workspace
-
-            @property
-            def num(self):
-                return self._num
-
-            def open_stream(self, suffix=''):
-                stream_name = '{}_{:08x}.{}'.format(self._prefix, self._num, suffix)
-                return self._ws.save_stream(stream_name)
- 
+    def testcase(self, prefix="test"):
         return Testcase(self, prefix)
 
     @property
@@ -457,20 +526,59 @@ class ManticoreOutput(object):
         :rtype: str
         """
         if self._descriptor is None:
-            self._descriptor = '{}:{}'.format(self._store.store_type, self._store.uri)
+            self._descriptor = f"{self._store.store_type}:{self._store.uri}"
 
         return self._descriptor
 
-    @sync
     def _increment_id(self):
-        self._last_id = self._id_gen.value
-        self._id_gen.value += 1
-        return self._last_id
+        """
+        Get a unique testcase id.
+
+        :rtype: int
+        """
+        filename = ".testcase_id"
+        with self._store.lock():
+            try:
+                with self._store.stream(filename, "r") as f:
+                    last_id = int(f.read())
+            except Exception as e:
+                last_id = 0
+            else:
+                last_id += 1
+            with self._store.stream(filename, "w") as f:
+                f.write(f"{last_id}")
+                f.flush()
+        return last_id
+
+    @property
+    def _last_id(self):
+        try:
+            with self._store.stream(filename, "r") as f:
+                last_id = int(f.read())
+        except Exception as e:
+            last_id = 0
+        return last_id
 
     def _named_key(self, suffix):
-        return '{}_{:08x}.{}'.format(self._named_key_prefix, self._last_id, suffix)
+        return f"{self._named_key_prefix}_{self._last_id:08x}.{suffix}"
 
-    def save_testcase(self, state, prefix, message=''):
+    def save_stream(self, key, *rest, **kwargs):
+        return self._store.save_stream(key, *rest, **kwargs)
+
+    @contextmanager
+    def _named_stream(self, name, binary=False, lock=False):
+        """
+        Create an indexed output stream i.e. 'test_00000001.name'
+
+        :param name: Identifier for the stream
+        :param lock: exclusive access if True
+        :return: A context-managed stream-like object
+        """
+        with self._store.save_stream(self._named_key(name), binary=binary, lock=lock) as s:
+            yield s
+
+    # Remove/move ...
+    def save_testcase(self, state, testcase, message=""):
         """
         Save the environment from `state` to storage. Return a state id
         describing it, which should be an int or a string.
@@ -480,110 +588,66 @@ class ManticoreOutput(object):
         :return: A state id representing the saved state
         """
 
-        self._named_key_prefix = prefix
-        self._increment_id()
-
-        self.save_summary(state, message)
-        self.save_trace(state)
-        self.save_constraints(state)
-        self.save_input_symbols(state)
+        # TODO / FIXME: We should move workspace to core/workspace and create a workspace for evm and native binaries
+        # The workspaces should override `save_testcase` method
+        #
+        # Below is native-only
+        self.save_summary(testcase, state, message)
+        self.save_trace(testcase, state)
+        self.save_constraints(testcase, state)
+        self.save_input_symbols(testcase, state)
 
         for stream_name, data in state.platform.generate_workspace_files().items():
-            with self._named_stream(stream_name) as stream:
+            with testcase.open_stream(stream_name, binary=True) as stream:
+                if isinstance(data, str):
+                    data = data.encode()
                 stream.write(data)
 
-        self._store.save_state(state, self._named_key('pkl'))
-        return self._last_id
+        # self._store.save_state(state, self._named_key('pkl'))
+        return testcase
 
-    def save_stream(self, key, *rest, **kwargs):
-        return self._store.save_stream(key, *rest, **kwargs)
-
-    @contextmanager
-    def _named_stream(self, name):
-        """
-        Create an indexed output stream i.e. 'test_00000001.name'
-
-        :param name: Identifier for the stream
-        :return: A context-managed stream-like object
-        """
-        with self._store.save_stream(self._named_key(name)) as s:
-            yield s
-
-    def save_summary(self, state, message):
-        with self._named_stream('messages') as summary:
-            summary.write("Command line:\n  '{}'\n" .format(' '.join(sys.argv)))
-            summary.write('Status:\n  {}\n\n'.format(message))
-
-            # FIXME(mark) This is a temporary hack for EVM. We need to sufficiently
-            # abstract the below code to work on many platforms, not just Linux. Then
-            # we can remove this hack.
-            if getattr(state.platform, 'procs', None) is None:
-                import pprint
-                summary.write("EVM World:\n")
-                summary.write(pprint.pformat(state.platform._global_storage))
-                return
+    @staticmethod
+    def save_summary(testcase, state, message):
+        with testcase.open_stream("messages") as summary:
+            summary.write(f"Command line:\n  '{' '.join(sys.argv)}'\n")
+            summary.write(f"Status:\n  {message}\n\n")
 
             memories = set()
             for cpu in filter(None, state.platform.procs):
                 idx = state.platform.procs.index(cpu)
-                summary.write("================ PROC: %02d ================\n" % idx)
+                summary.write(f"================ PROC: {idx:02d} ================\n")
                 summary.write("Memory:\n")
                 if hash(cpu.memory) not in memories:
-                    summary.write(str(cpu.memory).replace('\n', '\n  '))
+                    summary.write(str(cpu.memory).replace("\n", "\n  "))
                     memories.add(hash(cpu.memory))
 
-                summary.write("CPU:\n{}".format(cpu))
+                summary.write(f"CPU:\n{cpu}")
 
                 if hasattr(cpu, "instruction") and cpu.instruction is not None:
                     i = cpu.instruction
-                    summary.write("  Instruction: 0x%x\t(%s %s)\n" % (
-                        i.address, i.mnemonic, i.op_str))
+                    summary.write(f"  Instruction: 0x{i.address:x}\t{i.mnemonic:s} {i.op_str:s})\n")
                 else:
                     summary.write("  Instruction: {symbolic}\n")
 
-    def save_trace(self, state):
-        with self._named_stream('trace') as f:
-            if 'trace' not in state.context:
+    @staticmethod
+    def save_trace(testcase, state):
+        with testcase.open_stream("trace") as f:
+            if "trace" not in state.context:
                 return
-            for entry in state.context['trace']:
-                f.write('0x{:x}\n'.format(entry))
+            for entry in state.context["trace"]:
+                f.write(f"0x{entry:x}\n")
 
-    def save_constraints(self, state):
+    @staticmethod
+    def save_constraints(testcase, state):
         # XXX(yan): We want to conditionally enable this check
         # assert solver.check(state.constraints)
 
-        with self._named_stream('smt') as f:
+        with testcase.open_stream("smt") as f:
             f.write(str(state.constraints))
 
-    def save_input_symbols(self, state):
-        with self._named_stream('input') as f:
+    @staticmethod
+    def save_input_symbols(testcase, state):
+        with testcase.open_stream("input") as f:
             for symbol in state.input_symbols:
-                buf = solver.get_value(state.constraints, symbol)
-                f.write('%s: %s\n' % (symbol.name, repr(buf)))
-
-    def save_syscall_trace(self, state):
-        with self._named_stream('syscalls') as f:
-            f.write(repr(state.platform.syscall_trace))
-
-    def save_fds(self, state):
-        def solve_to_fd(data, fd):
-            try:
-                for c in data:
-                    fd.write(chr(solver.get_value(state.constraints, c)))
-            except SolverException:
-                fd.write('{SolverException}')
-
-        with self._named_stream('stdout') as _out:
-            with self._named_stream('stderr') as _err:
-                with self._named_stream('stdin') as _in:
-                    with self._named_stream('net') as _net:
-                        for name, fd, data in state.platform.syscall_trace:
-                            if name in ('_transmit', '_write'):
-                                if fd == 1:
-                                    solve_to_fd(data, _out)
-                                elif fd == 2:
-                                    solve_to_fd(data, _err)
-                            if name in ('_recv'):
-                                solve_to_fd(data, _net)
-                            if name in ('_receive', '_read') and fd == 0:
-                                solve_to_fd(data, _in)
+                buf = Z3Solver().get_value(state.constraints, symbol)
+                f.write(f"{symbol.name}: {buf!r}\n")

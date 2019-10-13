@@ -1,8 +1,7 @@
-/* There is two main functions `explore` and  `explore2`
-`explore` is the first level of exploration, you have to call it multiple times to explore the path
-`explore2` is a bit more complex, the owner has to call first the `enable_exploration` function
+/* There are two main functions: `explore` and  `explore2`
+`explore` is the first level of exploration; you have to call it multiple times to explore the path
+`explore2` is a bit more complex; the owner has to call first the `enable_exploration` function
 */
-pragma solidity ^0.4.15;
 
 contract Coverage{
     address private owner;
@@ -47,7 +46,7 @@ contract Coverage{
     function add(address user, uint val)
         private
     {
-        // comment the require to trigger overflow
+        // comment out the require to trigger an overflow
         require(balances[user] + val >= val);
         balances[user] += val;
     }
@@ -55,14 +54,14 @@ contract Coverage{
     function remove(address user, uint val)
         private
     {
-        // comment the require to trigger underflow
+        // comment out the require to trigger an underflow
         require(balances[user] >= val);
         balances[user] -= val;
     }
 
     // Entry point for simple exploration
-    // Anyone can give or take to anyone
-    // But if you cant take to someone poorer than you
+    // Anyone can give to or take from anyone
+    // But you can't take from someone poorer than you
     function explore(uint value, address user, bool give)
         public
     {
@@ -74,7 +73,7 @@ contract Coverage{
         if(give){
             remove(msg.sender, value);
             add(user, value);
-            Give(msg.sender, user, value);
+            emit Give(msg.sender, user, value);
         }
         else{
             if( balances[user] > balances[msg.sender]){
@@ -84,11 +83,11 @@ contract Coverage{
                 value = diff >value ? value : diff;
                 add(msg.sender, value);
                 remove(user, value);
-                Take(msg.sender, user, value);
+                emit Take(msg.sender, user, value);
             }
             else{
                 // If you try to take to someone poorer than you
-                // you will give it the value
+                // you will instead give the specified value
                 remove(msg.sender, value);
                 add(user, value);
                 Give(msg.sender, user, value);
@@ -96,7 +95,7 @@ contract Coverage{
         }
     }
 
-    // Same as explore, but you can really take to anyone
+    // Same as explore, but you can really take from anyone
     function explore2(uint value, address user, bool give)
         onlyExplorationOn
         public
@@ -104,7 +103,7 @@ contract Coverage{
         if(give){
             remove(msg.sender, value);
             add(user, value);
-            Give(msg.sender, user, value);
+            emit Give(msg.sender, user, value);
         }
         else{
             uint diff;
@@ -113,7 +112,7 @@ contract Coverage{
             value = diff >value ? value : diff;
             add(msg.sender, value);
             remove(user, value);
-            Take(msg.sender, user, value);
+            emit Take(msg.sender, user, value);
         }
     }
 }
